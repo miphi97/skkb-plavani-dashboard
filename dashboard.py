@@ -1,4 +1,5 @@
 from pathlib import Path
+import io
 import re
 import altair as alt
 import pandas as pd
@@ -81,6 +82,13 @@ Pro skupinové a individuální lekce zobrazovat doporučení odděleně."""
 
 WEEKDAY_ORDER = ["Pondělí", "Úterý", "Středa", "Čtvrtek", "Pátek"]
 WEEKDAY_RANK = {day: index for index, day in enumerate(WEEKDAY_ORDER)}
+WEEKDAY_SHORT = {
+    "Pondělí": "PO",
+    "Úterý": "ÚT",
+    "Středa": "ST",
+    "Čtvrtek": "ČT",
+    "Pátek": "PÁ",
+}
 
 
 def normalize_text(value):
@@ -155,6 +163,15 @@ def classify_certainty(value):
     if "nevím" in text or "nevim" in text:
         return "Nejisté"
     return "Nejisté"
+
+
+def classify_satisfaction(value):
+    text = " ".join(normalize_text(value).lower().split())
+    if text.startswith("spíše ano") or text.startswith("spise ano"):
+        return "Spíše ano"
+    if text.startswith("ano"):
+        return "Ano"
+    return "Ostatní"
 
 
 def certainty_weight(certainty):
@@ -279,11 +296,48 @@ def sort_by_day_and_time(dataframe):
     return df_sorted.drop(columns=["_day_rank", "_time_rank"])
 
 
+def format_term_dict(term_dict):
+    day = normalize_text(term_dict.get("Den"))
+    time = normalize_text(term_dict.get("Čas"))
+    pool = normalize_text(term_dict.get("Bazén"))
+    day_short = WEEKDAY_SHORT.get(day, day)
+    return " ".join(part for part in [day_short, time, pool] if part).strip()
+
+
+def format_cell_value(value):
+    if isinstance(value, (list, tuple, set)):
+        parts = []
+        for item in value:
+            if isinstance(item, dict) and {"Den", "Čas", "Bazén"}.issubset(item.keys()):
+                parts.append(format_term_dict(item))
+            elif isinstance(item, dict):
+                parts.append(", ".join(f"{k}: {normalize_text(v)}" for k, v in item.items()))
+            else:
+                parts.append(normalize_text(item))
+        return "\n".join([part for part in parts if part])
+
+    if isinstance(value, dict):
+        if {"Den", "Čas", "Bazén"}.issubset(value.keys()):
+            return format_term_dict(value)
+        return ", ".join(f"{k}: {normalize_text(v)}" for k, v in value.items())
+
+    return value
+
+
+def prepare_dataframe_for_display(dataframe):
+    display_df = dataframe.copy()
+    for col in display_df.columns:
+        display_df[col] = display_df[col].apply(format_cell_value)
+    return display_df
+
+
+def render_dataframe(dataframe, **kwargs):
+    st.dataframe(prepare_dataframe_for_display(dataframe), **kwargs)
+
+
 @st.cache_data(show_spinner=False)
-def load_data():
-    base_dir = Path(__file__).resolve().parent
-    csv_path = base_dir / "Dotazník možností (Odpovědi) - Odpovědi formuláře 1.csv"
-    df = pd.read_csv(csv_path, encoding="utf-8-sig")
+def load_data(csv_bytes):
+    df = pd.read_csv(io.BytesIO(csv_bytes), encoding="utf-8-sig")
     df["response_id"] = df.index.astype(str)
 
     weekday_names = ["Pondělí", "Úterý", "Středa", "Čtvrtek", "Pátek"]
@@ -353,19 +407,37 @@ def load_data():
     return df
 
 
-df = load_data()
-notes_df = load_organizer_notes()
-notes_map = dict(zip(notes_df["response_id"], notes_df["Poznámka organizátora"]))
-df["Poznámka organizátora"] = df["response_id"].map(notes_map).fillna("")
-
 st.title("Dashboard SK KONTAKT BRNO")
 st.caption("Základní přehled odpovědí z dotazníku")
 
 with st.expander("📖 Jak pracovat s dashboardem"):
     st.markdown(GUIDE_TEXT)
 
+uploaded_file = st.file_uploader("Nahraj CSV soubor", type=["csv"])
+
+if uploaded_file is None:
+    st.info(
+        "Nahrajte CSV soubor s odpověďmi dotazníku.\n\n"
+        "Instrukce:\n"
+        "1. Klikněte na tlačítko pro nahrání souboru.\n"
+        "2. Vyberte export odpovědí z Google Forms ve formátu CSV.\n"
+        "3. Po nahrání se automaticky provede kompletní analýza."
+    )
+    st.stop()
+
+csv_bytes = uploaded_file.getvalue()
+if not csv_bytes:
+    st.error("Nahraný soubor je prázdný.")
+    st.stop()
+
+df = load_data(csv_bytes)
+notes_df = load_organizer_notes()
+notes_map = dict(zip(notes_df["response_id"], notes_df["Poznámka organizátora"]))
+df["Poznámka organizátora"] = df["response_id"].map(notes_map).fillna("")
+st.success(f"Nahrán soubor: {uploaded_file.name}")
+
 if df.empty:
-    st.error("Nebyla nalezena žádná data v CSV souboru.")
+    st.error("Nahraný CSV soubor neobsahuje žádná data.")
     st.stop()
 
 tabs = st.tabs([
@@ -389,16 +461,23 @@ with tabs[0]:
     individual_count = int(df[type_col].astype(str).str.lower().str.contains("indiv", na=False).sum()) if type_col else 0
 
     satisfaction_col = next((col for col in df.columns if "Vyhovuje Vám aktuální rozvrh?" in col), None)
-    yes_count = int(df[satisfaction_col].astype(str).str.lower().str.contains("ano", na=False).sum()) if satisfaction_col else 0
-    probably_yes_count = int(df[satisfaction_col].astype(str).str.lower().str.contains("spíše ano|spise ano", na=False).sum()) if satisfaction_col else 0
+    if satisfaction_col:
+        satisfaction_labels = df[satisfaction_col].apply(classify_satisfaction)
+        yes_count = int((satisfaction_labels == "Ano").sum())
+        probably_yes_count = int((satisfaction_labels == "Spíše ano").sum())
+    else:
+        yes_count = 0
+        probably_yes_count = 0
+    satisfied_count = yes_count + probably_yes_count
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Počet odpovědí", total_responses)
     col2.metric("Počet skupinových plavců", group_count)
     col3.metric("Počet individuálních plavců", individual_count)
-    col4.metric("Odpovědi Ano / Spíše ano", f"{yes_count} / {probably_yes_count}")
+    col4.metric("Spokojení (Ano + Spíše ano)", satisfied_count)
+    col4.caption(f"Ano: {yes_count} | Spíše ano: {probably_yes_count}")
 
-    st.dataframe(df[["group_terms", "individual_terms"]].head(), use_container_width=True)
+    render_dataframe(df[["group_terms", "individual_terms"]].head(), use_container_width=True)
 
 def build_term_summary(df, term_col, certainty_col):
     rows = []
@@ -494,7 +573,7 @@ with tabs[1]:
         st.info("Žádná data pro skupinové lekce.")
     else:
         group_summary = build_term_summary(group_data, "group_terms", "certainty_group")
-        st.dataframe(group_summary, use_container_width=True)
+        render_dataframe(group_summary, use_container_width=True)
 
         if not group_summary.empty:
             st.subheader("Heatmapa – vážená poptávka")
@@ -507,7 +586,7 @@ with tabs[2]:
         st.info("Žádná data pro individuální lekce.")
     else:
         individual_summary = build_term_summary(individual_data, "individual_terms", "certainty_individual")
-        st.dataframe(individual_summary, use_container_width=True)
+        render_dataframe(individual_summary, use_container_width=True)
 
         if not individual_summary.empty:
             st.subheader("Heatmapa – vážená poptávka")
@@ -531,7 +610,7 @@ with tabs[3]:
             ],
         }
     )
-    st.dataframe(certainty_overview, use_container_width=True)
+    render_dataframe(certainty_overview, use_container_width=True)
 
 with tabs[4]:
     page_header_with_help("Poptávka po termínech", f"{HELP_DEMAND}\n\n{HELP_WEIGHTED}", "help_demand")
@@ -542,7 +621,7 @@ with tabs[4]:
     if group_demand.empty:
         st.info("Žádná data pro skupinové lekce.")
     else:
-        st.dataframe(group_demand, use_container_width=True)
+        render_dataframe(group_demand, use_container_width=True)
 
     st.markdown("#### Individuální lekce")
     individual_data = get_preference_subset(df, "indiv")
@@ -550,7 +629,7 @@ with tabs[4]:
     if individual_demand.empty:
         st.info("Žádná data pro individuální lekce.")
     else:
-        st.dataframe(individual_demand, use_container_width=True)
+        render_dataframe(individual_demand, use_container_width=True)
 
 with tabs[5]:
     page_header_with_help("Klienti", f"{HELP_PROBLEMATIC}\n\n{HELP_FLEXIBLE}", "help_clients")
@@ -647,7 +726,7 @@ with tabs[5]:
         .rename(columns={"lesson_type": "Typ lekce", "active_certainty": "Jistota odpovědi"})
         .sort_values(["Počet klientů", "Typ lekce"], ascending=[False, True])
     )
-    st.dataframe(summary, use_container_width=True)
+    render_dataframe(summary, use_container_width=True)
 
     st.markdown("#### Seznam klientů")
 
@@ -685,7 +764,8 @@ with tabs[5]:
             "comment": "Komentář / specifický požadavek",
         }
     )
-    st.dataframe(client_table.style.apply(highlight_problematic_rows, axis=1), use_container_width=True)
+    display_client_table = prepare_dataframe_for_display(client_table)
+    st.dataframe(display_client_table.style.apply(highlight_problematic_rows, axis=1), use_container_width=True)
 
 with tabs[6]:
     page_header_with_help("Komentáře a požadavky", HELP_COMMENTS, "help_comments")
@@ -752,7 +832,7 @@ with tabs[6]:
     if comments_df.empty:
         st.info("Žádné odpovědi s komentářem nebo specifickým požadavkem.")
     else:
-        st.dataframe(comments_df, use_container_width=True)
+        render_dataframe(comments_df, use_container_width=True)
 
 with tabs[7]:
     page_header_with_help("Rizikoví klienti", HELP_PROBLEMATIC, "help_risky")
@@ -794,7 +874,7 @@ with tabs[7]:
     if risky_clients_view.empty:
         st.info("Žádní klienti nesplňují zadaná riziková kritéria.")
     else:
-        st.dataframe(risky_clients_view, use_container_width=True)
+        render_dataframe(risky_clients_view, use_container_width=True)
 
 with tabs[8]:
     page_header_with_help("Doporučení pro nový rozvrh", HELP_RECOMMENDATIONS, "help_recommendations")
@@ -804,11 +884,11 @@ with tabs[8]:
     if group_recommendations.empty:
         st.info("Žádná data pro skupinové lekce.")
     else:
-        st.dataframe(group_recommendations, use_container_width=True)
+        render_dataframe(group_recommendations, use_container_width=True)
 
     st.markdown("#### Individuální lekce")
     individual_recommendations = build_term_summary(get_preference_subset(df, "indiv"), "individual_terms", "certainty_individual")
     if individual_recommendations.empty:
         st.info("Žádná data pro individuální lekce.")
     else:
-        st.dataframe(individual_recommendations, use_container_width=True)
+        render_dataframe(individual_recommendations, use_container_width=True)
