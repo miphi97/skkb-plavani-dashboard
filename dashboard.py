@@ -169,9 +169,15 @@ def classify_satisfaction(value):
     text = " ".join(normalize_text(value).lower().split())
     if text.startswith("spíše ano") or text.startswith("spise ano"):
         return "Spíše ano"
+    if text.startswith("spíše ne") or text.startswith("spise ne"):
+        return "Spíše ne"
     if text.startswith("ano"):
         return "Ano"
-    return "Ostatní"
+    if text.startswith("ne"):
+        return "Ne"
+    # Fallback: nezařazené nebo prázdné odpovědi počítáme jako "Ne",
+    # aby rozpad vždy pokryl všechny respondenty.
+    return "Ne"
 
 
 def certainty_weight(certainty):
@@ -463,19 +469,85 @@ with tabs[0]:
     satisfaction_col = next((col for col in df.columns if "Vyhovuje Vám aktuální rozvrh?" in col), None)
     if satisfaction_col:
         satisfaction_labels = df[satisfaction_col].apply(classify_satisfaction)
-        yes_count = int((satisfaction_labels == "Ano").sum())
-        probably_yes_count = int((satisfaction_labels == "Spíše ano").sum())
     else:
-        yes_count = 0
-        probably_yes_count = 0
-    satisfied_count = yes_count + probably_yes_count
+        satisfaction_labels = pd.Series(["Ne"] * total_responses)
+
+    satisfaction_order = ["Ano", "Spíše ano", "Spíše ne", "Ne"]
+    satisfaction_counts = {
+        label: int((satisfaction_labels == label).sum())
+        for label in satisfaction_order
+    }
+    satisfied_count = satisfaction_counts["Ano"] + satisfaction_counts["Spíše ano"]
+    satisfaction_total = sum(satisfaction_counts.values())
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Počet odpovědí", total_responses)
     col2.metric("Počet skupinových plavců", group_count)
     col3.metric("Počet individuálních plavců", individual_count)
     col4.metric("Spokojení (Ano + Spíše ano)", satisfied_count)
-    col4.caption(f"Ano: {yes_count} | Spíše ano: {probably_yes_count}")
+    col4.caption(f"Ano: {satisfaction_counts['Ano']} | Spíše ano: {satisfaction_counts['Spíše ano']}")
+
+    schedule_df = pd.DataFrame(
+        {
+            "Odpověď": satisfaction_order,
+            "Počet": [satisfaction_counts[label] for label in satisfaction_order],
+        }
+    )
+    schedule_df["Procento"] = ((schedule_df["Počet"] / total_responses) * 100).round(1)
+
+    chart_col1, chart_col2 = st.columns(2)
+    with chart_col1:
+        st.markdown("#### Sloupcový graf odpovědí")
+        bar_chart = alt.Chart(schedule_df).mark_bar().encode(
+            x=alt.X("Odpověď:N", sort=satisfaction_order, title="Odpověď"),
+            y=alt.Y("Počet:Q", title="Počet respondentů"),
+            color=alt.Color(
+                "Odpověď:N",
+                sort=satisfaction_order,
+                legend=None,
+                scale=alt.Scale(
+                    domain=satisfaction_order,
+                    range=["#2e7d32", "#66bb6a", "#f9a825", "#c62828"],
+                ),
+            ),
+            tooltip=[
+                alt.Tooltip("Odpověď:N", title="Odpověď"),
+                alt.Tooltip("Počet:Q", title="Počet", format=".0f"),
+                alt.Tooltip("Procento:Q", title="Procento", format=".1f"),
+            ],
+        )
+        st.altair_chart(bar_chart, use_container_width=True)
+
+    with chart_col2:
+        st.markdown("#### Koláčový graf odpovědí")
+        pie_chart = alt.Chart(schedule_df).mark_arc().encode(
+            theta=alt.Theta("Počet:Q"),
+            color=alt.Color(
+                "Odpověď:N",
+                sort=satisfaction_order,
+                scale=alt.Scale(
+                    domain=satisfaction_order,
+                    range=["#2e7d32", "#66bb6a", "#f9a825", "#c62828"],
+                ),
+                legend=alt.Legend(title="Odpověď"),
+            ),
+            tooltip=[
+                alt.Tooltip("Odpověď:N", title="Odpověď"),
+                alt.Tooltip("Počet:Q", title="Počet", format=".0f"),
+                alt.Tooltip("Procento:Q", title="Procento", format=".1f"),
+            ],
+        )
+        st.altair_chart(pie_chart, use_container_width=True)
+
+    st.markdown("#### Přehled odpovědí")
+    schedule_table = schedule_df.copy()
+    schedule_table["Procento"] = schedule_table["Procento"].map(lambda value: f"{value:.1f} %")
+    render_dataframe(schedule_table, use_container_width=True)
+
+    if satisfaction_total != total_responses:
+        st.error(
+            f"Kontrola součtu neprošla: součet odpovědí ({satisfaction_total}) neodpovídá počtu respondentů ({total_responses})."
+        )
 
     render_dataframe(df[["group_terms", "individual_terms"]].head(), use_container_width=True)
 
